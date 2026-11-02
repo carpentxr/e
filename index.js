@@ -7366,7 +7366,7 @@ async function dropStaffPlacement(discordId, { reason = "rank change", guild = n
   const officeDeactivation = await deactivateOfficeDepartmentPlacement(
     String(discordId),
     reason,
-    placement.updatedAt || new Date(),
+    new Date(),
   );
   if (!officeDeactivation.ok && officeDeactivation.reason !== "not_configured") {
     console.warn(
