@@ -83,7 +83,9 @@ function makeSyncHarness(overrides = {}) {
     ...overrides,
   };
   const sync = vm.runInNewContext(syncPlacementSource + "\nsyncOfficeDepartmentPlacement;", context);
-  const deactivate = vm.runInNewContext(deactivateSource + "\ndeactivateOfficeDepartmentPlacement;", context);
+  // Evaluate the real RPC wrapper separately so it does not replace the sync mock.
+  const deactivateContext = { ...context };
+  const deactivate = vm.runInNewContext(deactivateSource + "\ndeactivateOfficeDepartmentPlacement;", deactivateContext);
   return { calls, context, sync, deactivate, deactivations };
 }
 
