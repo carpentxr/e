@@ -23094,10 +23094,19 @@ async function syncOfficeDepartmentPlacement(placement, triggeredBy = "scheduled
   }
 
   const identity = resolved.body;
+  const verificationStatus = String(identity.verificationStatus || "");
   const verificationIsValid = ["verified", "verified_former_username"].includes(
-    String(identity.verificationStatus || ""),
+    verificationStatus,
   );
-  if (!verificationIsValid || String(identity.robloxUserId || "") !== robloxUserId) {
+
+  // A missing/ambiguous cached Roblox ID is inconclusive, not proof that the
+  // member lost verification. Preserve the current Office assignment until the
+  // resolver can positively confirm or contradict the identity.
+  if (!verificationIsValid || !identity.robloxUserId) {
+    return { ok: false, reason: "office_identity_verification_inconclusive" };
+  }
+
+  if (String(identity.robloxUserId) !== robloxUserId) {
     const deactivated = await deactivateOfficeDepartmentPlacement(
       discordUserId, "office_identity_verification_mismatch", placement.updatedAt || new Date(),
     );
