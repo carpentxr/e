@@ -7363,16 +7363,18 @@ async function dropStaffPlacement(discordId, { reason = "rank change", guild = n
     );
     return null;
   }
-  const officeDeactivation = await deactivateOfficeDepartmentPlacement(
-    String(discordId),
-    reason,
-    new Date(),
-  );
-  if (!officeDeactivation.ok && officeDeactivation.reason !== "not_configured") {
-    console.warn(
-      "[Office] removal mirror pending for " + discordId + ": " + officeDeactivation.reason,
-    );
-  }
+  // Mirror the removal in the background; never delay the bot's placement flow.
+  void deactivateOfficeDepartmentPlacement(String(discordId), reason, new Date())
+    .then(officeDeactivation => {
+      if (!officeDeactivation.ok && officeDeactivation.reason !== "not_configured") {
+        console.warn(
+          "[Office] removal mirror pending for " + discordId + ": " + officeDeactivation.reason,
+        );
+      }
+    })
+    .catch(error => {
+      console.warn("[Office] removal mirror failed for " + discordId + ":", error.message);
+    });
   console.log(
     `[Placement] Cleared ${placement.placementType}:${placement.placementKey} for ${discordId} (${placement.robloxUsername || "unknown"}) — ${reason}.`,
   );
@@ -9698,13 +9700,18 @@ async function assignStaffPlacement(interaction, placementType, placementKey) {
     { upsert: true, new: true },
   );
 
-  // Office is a mirror only; sync failure never undoes the MongoDB assignment.
-  const officePlacementSync = await syncOfficeDepartmentPlacement(placementDoc, "assignment");
-  if (!officePlacementSync.ok && officePlacementSync.reason !== "not_configured") {
-    console.warn(
-      "[Office] assignment mirror pending for " + targetUser.id + ": " + officePlacementSync.reason,
-    );
-  }
+  // Office is a mirror only; never delay the Discord placement flow for its network request.
+  void syncOfficeDepartmentPlacement(placementDoc, "assignment")
+    .then(officePlacementSync => {
+      if (!officePlacementSync.ok && officePlacementSync.reason !== "not_configured") {
+        console.warn(
+          "[Office] assignment mirror pending for " + targetUser.id + ": " + officePlacementSync.reason,
+        );
+      }
+    })
+    .catch(error => {
+      console.warn("[Office] assignment mirror failed for " + targetUser.id + ":", error.message);
+    });
 
   const targetMember = await interaction.guild.members.fetch(targetUser.id).catch(() => null);
   const roleUpdate = targetMember
