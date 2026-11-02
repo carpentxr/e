@@ -23046,6 +23046,8 @@ async function syncOfficeDepartmentPlacement(placement, triggeredBy = "scheduled
   try {
     verifiedRow = await VerifiedUser.findOne({ discordId: discordUserId }).lean();
   } catch (error) {
+    // A database read failure is not evidence that verification disappeared.
+    // Do not revoke an existing Office placement during a transient outage.
     return { ok: false, reason: "verification_store_unavailable", detail: error.message };
   }
 
@@ -23075,11 +23077,13 @@ async function syncOfficeDepartmentPlacement(placement, triggeredBy = "scheduled
   if (resolved.statusCode >= 500) {
     return { ok: false, reason: "identity_resolver_unavailable" };
   }
+  if (resolved.statusCode === 400) {
+    // A malformed or invalid recorded address needs correction; it is not
+    // sufficient evidence to revoke a previously linked Office identity.
+    return { ok: false, reason: "office_email_invalid" };
+  }
   if (resolved.statusCode !== 200 || !resolved.body || resolved.body.ok !== true) {
-    const deactivated = await deactivateOfficeDepartmentPlacement(
-      discordUserId, "office_identity_no_longer_resolves", placement.updatedAt || new Date(),
-    );
-    return { ok: false, reason: "office_identity_no_longer_resolves", deactivated: deactivated.ok };
+    return { ok: false, reason: "office_identity_resolution_inconclusive" };
   }
 
   const identity = resolved.body;
