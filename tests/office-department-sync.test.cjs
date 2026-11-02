@@ -42,7 +42,9 @@ const placement = {
 
 function makeSyncHarness(overrides = {}) {
   const calls = [];
+  const deactivations = [];
   const context = {
+    Date,
     console: { warn() {}, log() {}, error() {} },
     OFFICE_EMAIL_DOMAIN: "sweetsiez.com",
     getOfficeSupabaseConfig: () => ({ url: "https://example.supabase.co", key: "test-key" }),
@@ -75,14 +77,14 @@ function makeSyncHarness(overrides = {}) {
       return { ok: true };
     },
     deactivateOfficeDepartmentPlacement: async (...args) => {
-      calls.push({ deactivate: args });
+      deactivations.push(args);
       return { ok: true };
     },
     ...overrides,
   };
   const sync = vm.runInNewContext(syncPlacementSource + "\nsyncOfficeDepartmentPlacement;", context);
   const deactivate = vm.runInNewContext(deactivateSource + "\ndeactivateOfficeDepartmentPlacement;", context);
-  return { calls, context, sync, deactivate };
+  return { calls, context, sync, deactivate, deactivations };
 }
 
 test("verified, uniquely resolved placement is mirrored with its Office profile", async () => {
@@ -118,7 +120,7 @@ test("ambiguous Discord candidates are mirrored without linking a profile", asyn
   assert.equal(result.ok, true);
   assert.equal(result.profileLinked, false);
   assert.equal(h.calls[0].payload.p_profile_id, null);
-  assert.equal(h.calls.some(call => call.deactivate), false);
+  assert.equal(h.deactivations.length, 0);
 });
 
 test("inconclusive identity resolution never deactivates an existing placement", async () => {
@@ -153,11 +155,9 @@ test("a positively mismatched Roblox identity deactivates the old Discord placem
   const result = await h.sync(placement, "test");
 
   assert.equal(result.reason, "office_identity_verification_mismatch");
-  assert.equal(h.calls.length, 1);
-  assert.deepEqual(h.calls[0].deactivate.slice(0, 2), [
-    "discord-123",
-    "office_identity_verification_mismatch",
-  ]);
+  assert.equal(h.deactivations.length, 1);
+  assert.equal(h.deactivations[0][0], "discord-123");
+  assert.equal(h.deactivations[0][1], "office_identity_verification_mismatch");
 });
 
 test("a failed Supabase assignment request is returned as a failure, not thrown", async () => {
