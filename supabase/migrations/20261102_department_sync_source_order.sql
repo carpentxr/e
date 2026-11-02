@@ -34,6 +34,7 @@ BEGIN
      OR nullif(trim(p_roblox_username), '') IS NULL
      OR nullif(trim(p_placement_key), '') IS NULL
      OR nullif(trim(p_placement_label), '') IS NULL
+     OR p_department_key IS NULL
      OR p_placement_type IS NULL
   THEN
     RAISE EXCEPTION 'Required department assignment fields are missing';
