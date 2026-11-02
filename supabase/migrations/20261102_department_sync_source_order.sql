@@ -1,6 +1,45 @@
--- Prevent an older bot request from overwriting a newer department change.
+-- Align the existing Office table with the one-placement-per-member sync model.
 -- Apply in Supabase SQL Editor before merging/deploying the bot integration.
+--
+-- Existing rows are preserved. Legacy placement metadata stays NULL until the
+-- bot performs a fresh sync; no historical values are guessed.
 
+ALTER TABLE public.member_department_assignments
+  ADD COLUMN IF NOT EXISTS id uuid DEFAULT gen_random_uuid(),
+  ADD COLUMN IF NOT EXISTS placement_key text,
+  ADD COLUMN IF NOT EXISTS placement_label text,
+  ADD COLUMN IF NOT EXISTS assigned_by_discord_id text,
+  ADD COLUMN IF NOT EXISTS assigned_by_tag text,
+  ADD COLUMN IF NOT EXISTS inactive_reason text;
+
+UPDATE public.member_department_assignments
+SET id = gen_random_uuid()
+WHERE id IS NULL;
+
+ALTER TABLE public.member_department_assignments
+  ALTER COLUMN id SET DEFAULT gen_random_uuid(),
+  ALTER COLUMN id SET NOT NULL,
+  ALTER COLUMN profile_id DROP NOT NULL;
+
+-- profile_id is an optional link to a verified Office profile, not the row
+-- identity. The row itself is uniquely identified by its generated id.
+ALTER TABLE public.member_department_assignments
+  DROP CONSTRAINT IF EXISTS member_department_assignments_pkey;
+
+ALTER TABLE public.member_department_assignments
+  ADD CONSTRAINT member_department_assignments_pkey PRIMARY KEY (id);
+
+-- Preserve the one-placement-per-Discord-member rule and the one-active
+-- Discord identity per linked Office profile rule.
+CREATE UNIQUE INDEX IF NOT EXISTS member_department_assignments_discord_user_id_key
+  ON public.member_department_assignments (discord_user_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS member_department_assignments_profile_unique
+  ON public.member_department_assignments (profile_id)
+  WHERE profile_id IS NOT NULL AND is_active = true;
+
+
+-- Prevent an older bot request from overwriting a newer department change.
 CREATE OR REPLACE FUNCTION public.office_sync_department_assignment(
   p_discord_user_id text,
   p_profile_id uuid,
@@ -143,7 +182,11 @@ BEGIN
   )
   ON CONFLICT (discord_user_id)
   DO UPDATE SET
-    profile_id = EXCLUDED.profile_id,
+    -- An ambiguous resolver result must not erase a previously verified link.
+    profile_id = coalesce(
+      EXCLUDED.profile_id,
+      public.member_department_assignments.profile_id
+    ),
     roblox_user_id = EXCLUDED.roblox_user_id,
     roblox_username = EXCLUDED.roblox_username,
     department_key = EXCLUDED.department_key,
