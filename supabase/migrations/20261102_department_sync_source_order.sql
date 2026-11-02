@@ -22,9 +22,34 @@ ALTER TABLE public.member_department_assignments
 
 -- profile_id is an optional link to a verified Office profile, not the row
 -- identity. The row itself is uniquely identified by its generated id.
--- Drop the old primary key before relaxing profile_id's NOT NULL property.
-ALTER TABLE public.member_department_assignments
-  DROP CONSTRAINT IF EXISTS member_department_assignments_pkey;
+-- Discover and drop whichever primary-key constraint currently includes
+-- profile_id before relaxing its NOT NULL property.
+DO $migration$
+DECLARE
+  v_primary_key_name text;
+BEGIN
+  SELECT con.conname
+    INTO v_primary_key_name
+  FROM pg_catalog.pg_constraint AS con
+  WHERE con.conrelid = 'public.member_department_assignments'::regclass
+    AND con.contype = 'p'
+    AND EXISTS (
+      SELECT 1
+      FROM unnest(con.conkey) AS key_column(attnum)
+      JOIN pg_catalog.pg_attribute AS attr
+        ON attr.attrelid = con.conrelid
+       AND attr.attnum = key_column.attnum
+      WHERE attr.attname = 'profile_id'
+    );
+
+  IF v_primary_key_name IS NOT NULL THEN
+    EXECUTE format(
+      'ALTER TABLE public.member_department_assignments DROP CONSTRAINT %I',
+      v_primary_key_name
+    );
+  END IF;
+END;
+$migration$;
 
 ALTER TABLE public.member_department_assignments
   ALTER COLUMN profile_id DROP NOT NULL;
