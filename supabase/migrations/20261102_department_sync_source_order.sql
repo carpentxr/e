@@ -18,13 +18,16 @@ WHERE id IS NULL;
 
 ALTER TABLE public.member_department_assignments
   ALTER COLUMN id SET DEFAULT gen_random_uuid(),
-  ALTER COLUMN id SET NOT NULL,
-  ALTER COLUMN profile_id DROP NOT NULL;
+  ALTER COLUMN id SET NOT NULL;
 
 -- profile_id is an optional link to a verified Office profile, not the row
 -- identity. The row itself is uniquely identified by its generated id.
+-- Drop the old primary key before relaxing profile_id's NOT NULL property.
 ALTER TABLE public.member_department_assignments
   DROP CONSTRAINT IF EXISTS member_department_assignments_pkey;
+
+ALTER TABLE public.member_department_assignments
+  ALTER COLUMN profile_id DROP NOT NULL;
 
 ALTER TABLE public.member_department_assignments
   ADD CONSTRAINT member_department_assignments_pkey PRIMARY KEY (id);
