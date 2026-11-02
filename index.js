@@ -7363,6 +7363,16 @@ async function dropStaffPlacement(discordId, { reason = "rank change", guild = n
     );
     return null;
   }
+  const officeDeactivation = await deactivateOfficeDepartmentPlacement(
+    String(discordId),
+    reason,
+    placement.updatedAt || new Date(),
+  );
+  if (!officeDeactivation.ok && officeDeactivation.reason !== "not_configured") {
+    console.warn(
+      "[Office] removal mirror pending for " + discordId + ": " + officeDeactivation.reason,
+    );
+  }
   console.log(
     `[Placement] Cleared ${placement.placementType}:${placement.placementKey} for ${discordId} (${placement.robloxUsername || "unknown"}) — ${reason}.`,
   );
@@ -9687,6 +9697,14 @@ async function assignStaffPlacement(interaction, placementType, placementKey) {
     },
     { upsert: true, new: true },
   );
+
+  // Office is a mirror only; sync failure never undoes the MongoDB assignment.
+  const officePlacementSync = await syncOfficeDepartmentPlacement(placementDoc, "assignment");
+  if (!officePlacementSync.ok && officePlacementSync.reason !== "not_configured") {
+    console.warn(
+      "[Office] assignment mirror pending for " + targetUser.id + ": " + officePlacementSync.reason,
+    );
+  }
 
   const targetMember = await interaction.guild.members.fetch(targetUser.id).catch(() => null);
   const roleUpdate = targetMember
@@ -22932,6 +22950,316 @@ async function runOfficeIdentitySync(triggeredBy = "scheduled") {
 
   return { processed: queue.length, applied, failures };
 }
+
+
+/**
+ * SWEETSIEZ OFFICE — department placement bridge.
+ * MongoDB staffplacements remains authoritative; Supabase is a reconciled mirror.
+ */
+let officeDepartmentSyncRunning = false;
+
+async function getOfficeRows(pathname) {
+  const config = getOfficeSupabaseConfig();
+  if (!config) return { ok: false, reason: "not_configured" };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OFFICE_SYNC_TIMEOUT_MS);
+  try {
+    const response = await fetch(config.url + pathname, {
+      method: "GET",
+      headers: { apikey: config.key, authorization: "Bearer " + config.key },
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    let json = null;
+    if (text) {
+      try { json = JSON.parse(text); } catch { json = null; }
+    }
+    if (!response.ok) {
+      return { ok: false, reason: "http_" + response.status, detail: text.slice(0, 300) };
+    }
+    return { ok: true, rows: Array.isArray(json) ? json : [] };
+  } catch (error) {
+    return { ok: false, reason: "request_failed", detail: error.message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function getOfficeProfileIdByEmail(email) {
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  if (!normalizedEmail) return { ok: false, reason: "missing_email" };
+  const result = await getOfficeRows(
+    "/rest/v1/profiles?select=id,email&email=eq." +
+    encodeURIComponent(normalizedEmail) + "&limit=2",
+  );
+  if (!result.ok) return result;
+  if (result.rows.length !== 1 || !result.rows[0] || !result.rows[0].id) {
+    return {
+      ok: false,
+      reason: result.rows.length === 0 ? "office_profile_not_found" : "office_profile_email_not_unique",
+    };
+  }
+  return { ok: true, profileId: String(result.rows[0].id) };
+}
+
+async function deactivateOfficeDepartmentPlacement(
+  discordUserId,
+  reason = "removed_by_bot",
+  sourceUpdatedAt = new Date(),
+) {
+  return callOfficeSupabase("/rest/v1/rpc/office_deactivate_department_assignment", {
+    p_discord_user_id: String(discordUserId || "").trim(),
+    p_inactive_reason: String(reason || "removed_by_bot").slice(0, 300),
+    p_source_updated_at: sourceUpdatedAt instanceof Date
+      ? sourceUpdatedAt.toISOString()
+      : String(sourceUpdatedAt || new Date().toISOString()),
+  });
+}
+
+/**
+ * Only sync a placement after the existing identity resolver proves the Roblox
+ * identity and Discord candidate. Ambiguous Discord matches stay unlinked.
+ */
+async function syncOfficeDepartmentPlacement(placement, triggeredBy = "scheduled") {
+  if (!getOfficeSupabaseConfig()) return { ok: false, reason: "not_configured" };
+  if (!placement || !placement.discordId) return { ok: false, reason: "invalid_placement" };
+
+  const discordUserId = String(placement.discordId).trim();
+  const robloxUserId = String(placement.robloxUserId || "").trim();
+  const placementType = String(placement.placementType || "").trim();
+  const placementKey = String(placement.placementKey || "").trim();
+  const placementConfig = getPlacementConfig(placementType, placementKey);
+  if (!robloxUserId || !placementConfig) {
+    return { ok: false, reason: "invalid_mongo_placement" };
+  }
+
+  const boardKey = placementType === "team"
+    ? String(placementConfig.boardKey || "")
+    : placementKey;
+  const boardConfig = SWEETSIEZ_STRUCTURE_CONFIG.BOARDS[boardKey];
+  const departmentKey = boardConfig && boardConfig.aliasOf ? boardConfig.aliasOf : boardKey;
+  if (!["operations", "marketing", "moderation"].includes(departmentKey)) {
+    return { ok: false, reason: "unsupported_department" };
+  }
+
+  let verifiedRow;
+  try {
+    verifiedRow = await VerifiedUser.findOne({ discordId: discordUserId }).lean();
+  } catch (error) {
+    return { ok: false, reason: "verification_store_unavailable", detail: error.message };
+  }
+
+  if (!verifiedRow) {
+    const deactivated = await deactivateOfficeDepartmentPlacement(
+      discordUserId, "verified_identity_missing", placement.updatedAt || new Date(),
+    );
+    return { ok: false, reason: "verified_identity_missing", deactivated: deactivated.ok };
+  }
+
+  if (verifiedRow.robloxId && String(verifiedRow.robloxId) !== robloxUserId) {
+    const deactivated = await deactivateOfficeDepartmentPlacement(
+      discordUserId, "roblox_identity_mismatch", placement.updatedAt || new Date(),
+    );
+    return { ok: false, reason: "roblox_identity_mismatch", deactivated: deactivated.ok };
+  }
+
+  const username = String(verifiedRow.robloxUsername || placement.robloxUsername || "").trim();
+  if (!username) return { ok: false, reason: "verified_username_missing" };
+  const email = String(
+    verifiedRow.officeEmailLower ||
+    verifiedRow.officeEmail ||
+    (username + "@" + OFFICE_EMAIL_DOMAIN)
+  ).trim().toLowerCase();
+
+  const resolved = await resolveOfficeIdentityByEmail(email);
+  if (resolved.statusCode >= 500) {
+    return { ok: false, reason: "identity_resolver_unavailable" };
+  }
+  if (resolved.statusCode !== 200 || !resolved.body || resolved.body.ok !== true) {
+    const deactivated = await deactivateOfficeDepartmentPlacement(
+      discordUserId, "office_identity_no_longer_resolves", placement.updatedAt || new Date(),
+    );
+    return { ok: false, reason: "office_identity_no_longer_resolves", deactivated: deactivated.ok };
+  }
+
+  const identity = resolved.body;
+  const verificationIsValid = ["verified", "verified_former_username"].includes(
+    String(identity.verificationStatus || ""),
+  );
+  if (!verificationIsValid || String(identity.robloxUserId || "") !== robloxUserId) {
+    const deactivated = await deactivateOfficeDepartmentPlacement(
+      discordUserId, "office_identity_verification_mismatch", placement.updatedAt || new Date(),
+    );
+    return { ok: false, reason: "office_identity_verification_mismatch", deactivated: deactivated.ok };
+  }
+
+  if (identity.membershipStatus === "left_group") {
+    const deactivated = await deactivateOfficeDepartmentPlacement(
+      discordUserId, "member_left_roblox_group", placement.updatedAt || new Date(),
+    );
+    return { ok: false, reason: "member_left_roblox_group", deactivated: deactivated.ok };
+  }
+  if (identity.membershipStatus !== "in_group") {
+    return { ok: false, reason: "roblox_membership_unconfirmed" };
+  }
+
+  const candidateIds = Array.isArray(identity.discordUserIds)
+    ? identity.discordUserIds.map(value => String(value))
+    : [];
+  let profileId = null;
+  if (String(identity.discordUserId || "") === discordUserId) {
+    const profile = await getOfficeProfileIdByEmail(identity.email || email);
+    if (!profile.ok) return profile;
+    profileId = profile.profileId;
+  } else if (!identity.discordUserId && candidateIds.includes(discordUserId)) {
+    // Same verified Roblox account, multiple Discord candidates: never link a profile.
+    profileId = null;
+  } else {
+    const deactivated = await deactivateOfficeDepartmentPlacement(
+      discordUserId, "discord_identity_ambiguous_or_mismatched", placement.updatedAt || new Date(),
+    );
+    return {
+      ok: false,
+      reason: "discord_identity_ambiguous_or_mismatched",
+      deactivated: deactivated.ok,
+    };
+  }
+
+  const sourceUpdatedAt = placement.updatedAt || placement.assignedAt || new Date();
+  const write = await callOfficeSupabase("/rest/v1/rpc/office_sync_department_assignment", {
+    p_discord_user_id: discordUserId,
+    p_profile_id: profileId,
+    p_roblox_user_id: robloxUserId,
+    p_roblox_username: username,
+    p_department_key: departmentKey,
+    p_placement_type: placementType,
+    p_placement_key: placementKey,
+    p_placement_label: String(placement.placementLabel || placementConfig.label || placementKey),
+    p_assigned_by_discord_id: placement.assignedByDiscordId || null,
+    p_assigned_by_tag: placement.assignedByTag || null,
+    p_source_updated_at: sourceUpdatedAt instanceof Date
+      ? sourceUpdatedAt.toISOString()
+      : String(sourceUpdatedAt),
+  });
+  if (!write.ok) {
+    console.warn(
+      "[Office] department sync failed for " + discordUserId + " (" + triggeredBy + "): " +
+      write.reason + (write.detail ? " — " + write.detail : ""),
+    );
+    return write;
+  }
+  return { ok: true, profileLinked: Boolean(profileId), departmentKey };
+}
+
+async function listOfficeActiveDepartmentAssignments() {
+  const allRows = [];
+  const pageSize = 1000;
+  for (let offset = 0; ; offset += pageSize) {
+    const result = await getOfficeRows(
+      "/rest/v1/member_department_assignments?select=discord_user_id&is_active=eq.true" +
+      "&order=discord_user_id.asc&limit=" + pageSize + "&offset=" + offset,
+    );
+    if (!result.ok) return result;
+    allRows.push(...result.rows);
+    if (result.rows.length < pageSize) break;
+    if (offset >= 100000) {
+      return { ok: false, reason: "office_assignment_page_limit_reached" };
+    }
+  }
+  return { ok: true, rows: allRows };
+}
+
+/**
+ * MongoDB is authoritative. Never deactivate rows when either source read fails.
+ */
+async function runOfficeDepartmentSync(triggeredBy = "scheduled") {
+  if (officeDepartmentSyncRunning) return { skipped: true, reason: "already_running" };
+  if (!getOfficeSupabaseConfig()) return { skipped: true, reason: "not_configured" };
+  if (mongoose.connection.readyState !== 1) return { skipped: true, reason: "mongodb_unavailable" };
+
+  officeDepartmentSyncRunning = true;
+  try {
+    let placements;
+    try {
+      placements = await StaffPlacement.find({}).lean();
+    } catch (error) {
+      console.warn("[Office] department sync could not read MongoDB (" + triggeredBy + "):", error.message);
+      return { skipped: true, reason: "mongodb_read_failed" };
+    }
+    if (!Array.isArray(placements)) return { skipped: true, reason: "mongodb_read_failed" };
+
+    const mongoDiscordIds = new Set(
+      placements.map(row => String(row.discordId || "").trim()).filter(Boolean),
+    );
+    let applied = 0;
+    let failures = 0;
+
+    for (const placement of placements) {
+      try {
+        const result = await syncOfficeDepartmentPlacement(placement, triggeredBy);
+        if (result.ok) applied += 1;
+        else if (!["office_profile_not_found", "roblox_membership_unconfirmed"].includes(result.reason)) {
+          failures += 1;
+        }
+      } catch (error) {
+        failures += 1;
+        console.warn("[Office] department placement sync failed:", error.message);
+      }
+    }
+
+    const officeRows = await listOfficeActiveDepartmentAssignments();
+    if (!officeRows.ok) {
+      console.warn(
+        "[Office] department stale-row check skipped (" + officeRows.reason +
+        (officeRows.detail ? ": " + officeRows.detail : "") + ")",
+      );
+      return { processed: placements.length, applied, failures, staleCheck: "skipped" };
+    }
+
+    let deactivated = 0;
+    for (const row of officeRows.rows) {
+      const discordUserId = String(row.discord_user_id || "").trim();
+      if (!discordUserId || mongoDiscordIds.has(discordUserId)) continue;
+      const result = await deactivateOfficeDepartmentPlacement(
+        discordUserId, "placement_missing_from_mongodb", new Date(),
+      );
+      if (result.ok) deactivated += 1;
+      else failures += 1;
+    }
+
+    const summary =
+      "[Office] department sync (" + triggeredBy + "): " +
+      applied + "/" + placements.length + " active placements applied, " +
+      deactivated + " stale placements deactivated, " + failures + " issue(s)";
+    if (failures > 0) console.warn(summary);
+    else console.log(summary);
+    return { processed: placements.length, applied, deactivated, failures };
+  } finally {
+    officeDepartmentSyncRunning = false;
+  }
+}
+
+function startOfficeDepartmentSync() {
+  if (!getOfficeSupabaseConfig()) {
+    console.log("[Office] department sync DISABLED (set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)");
+    return null;
+  }
+  console.log(
+    "[Office] department sync ENABLED - reconciling MongoDB placements every " +
+    Math.round(OFFICE_SYNC_INTERVAL_MS / 1000) + "s",
+  );
+  runOfficeDepartmentSync("startup").catch(error =>
+    console.warn("[Office] department startup sync failed:", error.message),
+  );
+  const timer = setInterval(() => {
+    runOfficeDepartmentSync("scheduled").catch(error =>
+      console.warn("[Office] department scheduled sync failed:", error.message),
+    );
+  }, OFFICE_SYNC_INTERVAL_MS);
+  if (timer && typeof timer.unref === "function") timer.unref();
+  return timer;
+}
+
 
 /** Start the loop. Returns the timer, or null when the sync is not configured. */
 function startOfficeIdentitySync() {
@@ -54155,6 +54483,7 @@ client.on('messageUpdate', async (oldMsg, newMsg) => {
     // The Office never calls this bot (no TLS on its public port). The bot
     // pushes resolved identities into Supabase instead, from here.
     startOfficeIdentitySync();
+    startOfficeDepartmentSync();
     setInterval(
       () => runAlliancePostProofFollowUps("hourly scheduled scan").catch(err => console.error("Alliance proof follow-up scheduler error:", err.message)),
       60 * 60 * 1000,
